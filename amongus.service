@@ -1,0 +1,19 @@
+[Unit]
+Description=Among Us USB-camera herkenning
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=thien
+Group=video
+WorkingDirectory=/home/thien
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/thien/.Xauthority
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /home/thien/pi_usb_camera_stream.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target
