@@ -1,12 +1,12 @@
 """
-Laser spot detection with OpenCV for the Among Us laser pointing assignment.
+Laser dot detection with OpenCV for the Among Us laser-pointing assignment.
 
-Idea: instead of filtering by color (unreliable, because the Among Us
-image itself contains red/green/bright colors) or using a fixed
-brightness threshold (unreliable, because it no longer works when
-lighting/hardware settings change), we look at the brightest point in
-each frame and use a margin below it. As long as the laser is
-clearly brighter than its surroundings, this works regardless of lighting.
+Idea: instead of filtering on color (unreliable, since the Among Us
+picture itself also has red/green/bright colors) or a fixed brightness
+threshold (unreliable, since that stops being correct as soon as
+exposure/hardware settings change), we look at the brightest point in
+each frame and take a margin below it. As long as the laser is clearly
+brighter than its surroundings, this works regardless of exposure.
 
 Usage:
     python laser_detect.py --camera 0 --debug
@@ -31,7 +31,7 @@ class LaserDetector:
         camera_index: int = 0,
         frame_width: int = 640,
         frame_height: int = 480,
-        exposure: int = 0,           # leave at 0; adaptive threshold handles the rest
+        exposure: int = 0,           # leave at 0; the adaptive threshold does the rest
         min_peak_brightness: int = 40,   # frame must reach at least this peak level
         peak_margin: int = 15,           # how far below the peak still counts as "laser"
         min_area: int = 2,
@@ -58,23 +58,24 @@ class LaserDetector:
     def _configure_exposure(self, hw_brightness: int) -> None:
         """Optional hardware hint; the adaptive threshold does the heavy lifting.
 
-        We leave this at 0 by default (unchanged): measurements showed
-        that the 'brightness' control on this camera simply adds/subtracts
-        from every pixel (not actual exposure/gain). This reduces the laser
-        just as much as the background and therefore does not solve the problem.
-        The adaptive peak-margin threshold (see _brightness_mask) is more
-        robust: it looks at the brightest point in each frame, regardless of
-        how the hardware is otherwise configured.
+        We leave this at 0 (untouched) by default: measurements showed
+        that the 'brightness' control on this camera is a simple
+        add/subtract on every pixel (not a real exposure/gain control) —
+        it pulls the laser down just as much as the background, so it
+        doesn't actually solve anything. The adaptive peak-margin
+        threshold (see _brightness_mask) is more robust: it looks at the
+        brightest point per frame, regardless of how the hardware itself
+        is configured.
         """
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = manual (V4L2), if available
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = manual (V4L2), if supported
         self.cap.set(cv2.CAP_PROP_BRIGHTNESS, hw_brightness)
         self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
         self.cap.set(cv2.CAP_PROP_BACKLIGHT, 0)
 
         print(
-            f"[camera] requested brightness={hw_brightness} "
+            f"[camera] brightness requested={hw_brightness} "
             f"actual={self.cap.get(cv2.CAP_PROP_BRIGHTNESS)}, "
-            f"actual auto_wb={self.cap.get(cv2.CAP_PROP_AUTO_WB)}"
+            f"auto_wb actual={self.cap.get(cv2.CAP_PROP_AUTO_WB)}"
         )
 
     def _read_frame(self) -> np.ndarray | None:
@@ -85,13 +86,13 @@ class LaserDetector:
     def _brightness_map(frame: np.ndarray) -> np.ndarray:
         """Per-pixel brightness, robust for colored (e.g. red) lasers.
 
-        The standard cv2.COLOR_BGR2GRAY uses luminance weighting
-        (~0.30*R + 0.59*G + 0.11*B). A saturated red dot
-        (R=255,G=0,B=0) therefore gets a grayscale value of ~76,
-        well below a threshold such as 250 — even though the dot appears
-        very bright to the naked eye (or in the color frame). By taking
-        the MAXIMUM of the three channels for each pixel, a saturated
-        channel in any color is weighted equally.
+        The standard cv2.COLOR_BGR2GRAY conversion uses luminance
+        weighting (~0.30*R + 0.59*G + 0.11*B). A saturated red dot
+        (R=255,G=0,B=0) ends up at a gray value of only ~76 with that
+        formula, far below a threshold like 250 — even though the point
+        looks very bright to the eye (or in the color frame). By taking
+        the MAXIMUM of the three channels per pixel instead, a saturated
+        channel counts equally regardless of which color it is.
         """
         channel_max = np.max(frame, axis=2)
         return cv2.GaussianBlur(channel_max, (5, 5), 0)
@@ -99,16 +100,17 @@ class LaserDetector:
     def _brightness_mask(self, gray: np.ndarray) -> tuple[np.ndarray, int]:
         """Adaptive threshold instead of a fixed value.
 
-        A fixed threshold (e.g. 250) fails when the lighting/hardware
-        brightness changes: sometimes even the laser does not reach that
-        value (too dark), while sometimes the entire environment does
-        (too bright, or the camera compensates for movement). By looking
-        at the brightest point in this specific frame and using a margin
-        below it, this works regardless of the exact lighting — as long as
-        the laser is clearly brighter than the rest of the image.
+        A fixed threshold (e.g. 250) breaks as soon as exposure/hardware
+        brightness changes: sometimes even the laser doesn't reach it
+        (set too dark), sometimes the whole scene reaches it anyway (too
+        bright, or the camera compensating during movement). By looking
+        at the brightest point of this specific frame and taking a
+        margin below it, this works regardless of the exact exposure —
+        as long as the laser is clearly brighter than the rest of the
+        image.
 
-        Returns (mask, peak); peak is also used to ignore frames without
-        a visible laser (peak < min_peak_brightness).
+        Returns (mask, peak); peak is also used to ignore frames with no
+        visible laser (peak < min_peak_brightness).
         """
         peak = int(gray.max())
         if peak < self.min_peak_brightness:
@@ -157,7 +159,7 @@ class LaserDetector:
         if not candidates:
             return None
 
-        # Select the most circular candidate (most likely to be the laser rather than noise)
+        # Pick the most circular candidate (most likely to be the laser, not noise)
         cx, cy, _ = max(candidates, key=lambda c: c[2])
         self._history.append((cx, cy))
 
@@ -166,7 +168,7 @@ class LaserDetector:
         return avg_x, avg_y
 
     def get_last_frame(self) -> np.ndarray | None:
-        """For debugging purposes: retrieve the last captured frame again."""
+        """For debug purposes: read and return the latest frame again."""
         return self._read_frame()
 
     def release(self) -> None:
@@ -174,7 +176,7 @@ class LaserDetector:
 
 
 def run_debug(camera_index: int) -> None:
-    """Live debug view: shows the camera, threshold mask, and detected position."""
+    """Live debug view: shows the camera feed, the threshold mask, and the detected position."""
     det = LaserDetector(camera_index=camera_index)
     prev_time = time.time()
 
@@ -229,12 +231,12 @@ def run_debug(camera_index: int) -> None:
 
 
 def run_snapshot(camera_index: int, count: int, outdir: str) -> None:
-    """Saves `count` frames + their threshold masks as PNG files.
+    """Writes `count` frames + their threshold mask out as PNGs.
 
-    Use this when you do not have a screen/X11: copy the outdir back to
-    your own PC using scp and inspect the images. This lets you see exactly
-    what the camera captures and whether the threshold detects the laser,
-    without needing cv2.imshow on the Pi itself.
+    Use this if you don't have a display/X11: scp the outdir back to your
+    own machine and inspect the images. This lets you see exactly what
+    the camera is capturing and whether the threshold does/doesn't hit
+    the laser, without needing cv2.imshow on the Pi itself.
     """
     import os
 
@@ -258,18 +260,31 @@ def run_snapshot(camera_index: int, count: int, outdir: str) -> None:
     finally:
         det.release()
 
-    print(f"Done. View the PNGs in {outdir}/ (copy them back using scp).")
+    print(f"Done. Check the PNGs in {outdir}/ (scp them back to your machine).")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Laser spot detection debug tool")
+    parser = argparse.ArgumentParser(description="Laser dot detection debug tool")
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0)")
-    parser.add_argument("--debug", action="store_true", help="Open live debug window")
+    parser.add_argument("--debug", action="store_true", help="Open a live debug window")
     parser.add_argument(
         "--snapshot", type=int, default=0,
-        help="Number of frames+masks to save to ./snapshots instead of displaying live",
+        help="Write N frames+masks to ./snapshots instead of showing them live",
+    )
+    parser.add_argument(
+        "--button", type=int, default=None,
+        help="GPIO pin number of a start button. If set, waits for a press "
+             "before starting detection (wire the other leg to GND — "
+             "gpiozero uses the internal pull-up, no resistor needed).",
     )
     args = parser.parse_args()
+
+    if args.button is not None:
+        from gpiozero import Button  # imported lazily: only needed when --button is used
+
+        print(f"Waiting for button press on GPIO{args.button}...")
+        Button(args.button).wait_for_press()
+        print("Button pressed, starting.")
 
     if args.snapshot:
         run_snapshot(args.camera, args.snapshot, "snapshots")
@@ -286,4 +301,3 @@ if __name__ == "__main__":
             pass
         finally:
             detector.release()
-
