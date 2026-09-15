@@ -263,6 +263,40 @@ def run_snapshot(camera_index: int, count: int, outdir: str) -> None:
     print(f"Done. Check the PNGs in {outdir}/ (scp them back to your machine).")
 
 
+def run_with_toggle_button(camera_index: int, button_pin: int) -> None:
+    """Press the button to start detection, press again to stop — repeatable.
+
+    Uses gpiozero's when_pressed callback instead of a blocking wait, since
+    we need to react to a second press while the detection loop is already
+    running. `running` is flipped on each press; the loop only calls
+    get_laser_position() while `running` is True, otherwise it idles.
+    """
+    from gpiozero import Button  # imported lazily: only needed in this mode
+
+    state = {"running": False}
+
+    def toggle() -> None:
+        state["running"] = not state["running"]
+        print("Started detection" if state["running"] else "Stopped detection")
+
+    button = Button(button_pin, bounce_time=0.2)
+    button.when_pressed = toggle
+
+    print(f"Ready. Press the button on GPIO{button_pin} to start/stop.")
+    detector = LaserDetector(camera_index=camera_index)
+    try:
+        while True:
+            if state["running"]:
+                print(detector.get_laser_position())
+                time.sleep(0.05)
+            else:
+                time.sleep(0.1)  # idle, just waiting for a press
+    except KeyboardInterrupt:
+        pass
+    finally:
+        detector.release()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Laser dot detection debug tool")
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0)")
@@ -273,23 +307,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--button", type=int, default=None,
-        help="GPIO pin number of a start button. If set, waits for a press "
-             "before starting detection (wire the other leg to GND — "
-             "gpiozero uses the internal pull-up, no resistor needed).",
+        help="GPIO pin number of a start/stop button (toggle). Wire the "
+             "other leg to GND — gpiozero uses the internal pull-up, no "
+             "resistor needed. Only applies to the normal run mode, not "
+             "--debug or --snapshot.",
     )
     args = parser.parse_args()
-
-    if args.button is not None:
-        from gpiozero import Button  # imported lazily: only needed when --button is used
-
-        print(f"Waiting for button press on GPIO{args.button}...")
-        Button(args.button).wait_for_press()
-        print("Button pressed, starting.")
 
     if args.snapshot:
         run_snapshot(args.camera, args.snapshot, "snapshots")
     elif args.debug:
         run_debug(args.camera)
+    elif args.button is not None:
+        run_with_toggle_button(args.camera, args.button)
     else:
         detector = LaserDetector(camera_index=args.camera)
         try:
