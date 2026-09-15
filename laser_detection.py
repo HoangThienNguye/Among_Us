@@ -12,9 +12,13 @@ Usage:
     python laser_detect.py --camera 0 --debug
 
 As a module:
-    from laser_detect import LaserDetector
+    from laser_detection import LaserDetector
     det = LaserDetector(camera_index=0)
     x, y = det.get_laser_position()   # None if not found
+
+    # Zelfde frame als een andere detector (geen extra camera):
+    det = LaserDetector(open_camera=False)
+    x, y = det.detect_on_frame(frame)
 """
 
 import argparse
@@ -38,7 +42,19 @@ class LaserDetector:
         max_area: int = 400,
         min_circularity: float = 0.5,
         smoothing_window: int = 5,
+        open_camera: bool = True,
     ):
+        self.min_peak_brightness = min_peak_brightness
+        self.peak_margin = peak_margin
+        self.min_area = min_area
+        self.max_area = max_area
+        self.min_circularity = min_circularity
+        self._history: deque[tuple[float, float]] = deque(maxlen=smoothing_window)
+
+        self.cap = None
+        if not open_camera:
+            return
+
         self.cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open camera {camera_index}")
@@ -47,15 +63,8 @@ class LaserDetector:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
         self._configure_exposure(exposure)
 
-        self.min_peak_brightness = min_peak_brightness
-        self.peak_margin = peak_margin
-        self.min_area = min_area
-        self.max_area = max_area
-        self.min_circularity = min_circularity
-
-        self._history: deque[tuple[float, float]] = deque(maxlen=smoothing_window)
-
-    def _configure_exposure(self, hw_brightness: int) -> None:
+    @staticmethod
+    def configure_capture(cap, hw_brightness: int = 0) -> None:
         """Optional hardware hint; the adaptive threshold does the heavy lifting.
 
         We leave this at 0 (untouched) by default: measurements showed
@@ -67,18 +76,24 @@ class LaserDetector:
         brightest point per frame, regardless of how the hardware itself
         is configured.
         """
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = manual (V4L2), if supported
-        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, hw_brightness)
-        self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-        self.cap.set(cv2.CAP_PROP_BACKLIGHT, 0)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = manual (V4L2), if supported
+        cap.set(cv2.CAP_PROP_BRIGHTNESS, hw_brightness)
+        cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+        cap.set(cv2.CAP_PROP_BACKLIGHT, 0)
 
         print(
             f"[camera] brightness requested={hw_brightness} "
-            f"actual={self.cap.get(cv2.CAP_PROP_BRIGHTNESS)}, "
-            f"auto_wb actual={self.cap.get(cv2.CAP_PROP_AUTO_WB)}"
+            f"actual={cap.get(cv2.CAP_PROP_BRIGHTNESS)}, "
+            f"auto_wb actual={cap.get(cv2.CAP_PROP_AUTO_WB)}"
         )
 
+    def _configure_exposure(self, hw_brightness: int) -> None:
+        if self.cap is not None:
+            self.configure_capture(self.cap, hw_brightness)
+
     def _read_frame(self) -> np.ndarray | None:
+        if self.cap is None:
+            return None
         ok, frame = self.cap.read()
         return frame if ok else None
 
@@ -149,14 +164,14 @@ class LaserDetector:
 
         return candidates
 
-    def get_laser_position(self) -> tuple[float, float] | None:
-        """Returns the (smoothed) pixel position of the laser, or None."""
-        frame = self._read_frame()
-        if frame is None:
+    def detect_on_frame(self, frame: np.ndarray) -> tuple[float, float] | None:
+        """Laserpositie in een bestaand frame, zonder extra camera te openen."""
+        if frame is None or frame.size == 0:
             return None
 
         candidates = self._find_candidates(frame)
         if not candidates:
+            self._history.clear()
             return None
 
         # Pick the most circular candidate (most likely to be the laser, not noise)
@@ -167,12 +182,21 @@ class LaserDetector:
         avg_y = sum(p[1] for p in self._history) / len(self._history)
         return avg_x, avg_y
 
+    def get_laser_position(self) -> tuple[float, float] | None:
+        """Returns the (smoothed) pixel position of the laser, or None."""
+        frame = self._read_frame()
+        if frame is None:
+            return None
+        return self.detect_on_frame(frame)
+
     def get_last_frame(self) -> np.ndarray | None:
         """For debug purposes: read and return the latest frame again."""
         return self._read_frame()
 
     def release(self) -> None:
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
 
 
 def run_debug(camera_index: int) -> None:

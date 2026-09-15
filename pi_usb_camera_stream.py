@@ -18,11 +18,6 @@ from threading import Lock, Thread
 import cv2
 import numpy as np
 
-if sys.platform.startswith("win"):
-    print("Dit bestand is voor de Raspberry Pi.")
-    print("Op je laptop: start opdracht_amongus_raspberry.py")
-    raise SystemExit(1)
-
 os.chdir(os.path.dirname(os.path.abspath(__file__)) or ".")
 
 
@@ -282,11 +277,11 @@ def verwerk_frame(frame, vorige):
             kleur_box,
             2
         )
-    else:
-        vorige = None
-        positie_geschiedenis.clear()
+        return frame, vorige, (mx, my), kleur
 
-    return frame, vorige
+    vorige = None
+    positie_geschiedenis.clear()
+    return frame, vorige, None, None
 
 
 def open_camera():
@@ -325,7 +320,7 @@ def camera_loop(cap):
         if not ok:
             time.sleep(0.05)
             continue
-        frame, vorige = verwerk_frame(frame, vorige)
+        frame, vorige, _positie, _kleur = verwerk_frame(frame, vorige)
         ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_KWALITEIT])
         if not ok:
             continue
@@ -367,6 +362,11 @@ class StreamHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if sys.platform.startswith("win"):
+        print("Dit bestand is voor de Raspberry Pi.")
+        print("Op je laptop: start opdracht_amongus_raspberry.py")
+        raise SystemExit(1)
+
     cap = open_camera()
     Thread(target=camera_loop, args=(cap,), daemon=True).start()
     os.system(f"fuser -k {POORT}/tcp >/dev/null 2>&1")
