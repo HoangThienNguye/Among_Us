@@ -1,9 +1,8 @@
-#!/usr/bin/python3
 import pigpio
 import time
 
-servoX = 22  # GPIO 22
-servoY = 23  # GPIO 23
+servoX = 22  # Servo X op GPIO 22
+servoY = 23  # Servo Y op GPIO 23
 
 pwm = pigpio.pi()
 
@@ -11,79 +10,129 @@ if not pwm.connected:
     print("Kan geen verbinding maken met pigpio!")
     exit()
 
+
 pwm.set_mode(servoX, pigpio.OUTPUT)
 pwm.set_mode(servoY, pigpio.OUTPUT)
 
 
 def servo_off(servo):
+    """
+    Servo volledig stoppen.
+    """
     pwm.set_servo_pulsewidth(servo, 0)
     pwm.set_PWM_dutycycle(servo, 0)
     pwm.set_PWM_frequency(servo, 0)
 
 
-def servo_on(servo, pulsewidth):
-    # first we turn off both servo's
-    servo_off(servoX)
-    servo_off(servoY)
-
-    # turn on requested servo
+def servo_move(servo, pulsewidth):
+    """
+    Servo aansturen met een bepaalde pulsewidth.
+    """
     pwm.set_PWM_frequency(servo, 50)
     pwm.set_servo_pulsewidth(servo, pulsewidth)
 
 
-# ==========================
-# SERVO Y
-# ==========================
+def angle_to_pulsewidth(angle):
+    """
+    Zet hoek om naar pulsewidth.
 
-print("Servo Y - 0 graden")
-servo_on(servoY, 500)
-time.sleep(3)
+    0 graden   = 500 us
+    90 graden  = 1500 us
+    180 graden = 2500 us
+    """
 
-print("Servo Y - 90 graden")
-servo_on(servoY, 1500)
-time.sleep(3)
+    pulsewidth = 500 + (angle / 180) * 2000
 
-print("Servo Y - 180 graden")
-servo_on(servoY, 2500)
-time.sleep(3)
+    return int(pulsewidth)
 
+# Zorg dat beide servo's uit staan voordat we beginnen.
+servo_off(servoX)
 servo_off(servoY)
 
 
 # ==========================
-# SERVO X
+# SERVO X: 1 -> 90 GRADEN
 # ==========================
 
-print("Servo X - 0 graden")
-servo_on(servoX, 500)
-time.sleep(3)
+print("Servo X begint...")
 
-print("Servo X - 90 graden")
-servo_on(servoX, 1500)
-time.sleep(3)
+# Zorg dat Servo Y uit staat.
+servo_off(servoY)
 
-print("Servo X - 180 graden")
-servo_on(servoX, 2500)
-time.sleep(3)
+angle = 1
+
+while angle <= 90:
+
+    pulsewidth = angle_to_pulsewidth(angle)
+
+    servo_move(servoX, pulsewidth)
+
+    print(f"Servo X: {angle} graden")
+
+    time.sleep(0.1)
+
+    angle += 1
+
+
+# Servo X uitzetten
+servo_off(servoX)
+
+print("Servo X klaar.")
+
+
+# ==========================
+# SERVO Y: 1 -> 90 GRADEN
+# ==========================
+
+print("Servo Y begint...")
+
+# Zorg dat Servo X uit staat.
+servo_off(servoX)
+
+angle = 1
+
+while angle <= 90:
+
+    pulsewidth = angle_to_pulsewidth(angle)
+
+    servo_move(servoY, pulsewidth)
+
+    print(f"Servo Y: {angle} graden")
+
+    time.sleep(0.1)
+
+    angle += 1
+
+
+# Servo Y uitzetten
+servo_off(servoY)
+
+print("Servo Y klaar.")
+
+
+# ==========================
+# RESET NAAR 90 GRADEN
+# ==========================
+
+print("Reset naar 90 graden...")
+
+# Servo X naar 90 graden
+servo_off(servoY)
+
+servo_move(servoX, angle_to_pulsewidth(90))
+time.sleep(1)
 
 servo_off(servoX)
 
 
-# ==========================
-# RESET
-# ==========================
-
-print("Reset: Servo X naar 90 graden")
-servo_on(servoX, 1500)
-time.sleep(1)
+# Servo Y naar 90 graden
 servo_off(servoX)
 
-print("Reset: Servo Y naar 90 graden")
-servo_on(servoY, 1500)
+servo_move(servoY, angle_to_pulsewidth(90))
 time.sleep(1)
+
 servo_off(servoY)
 
 print("Beide servo's staan op 90 graden.")
 
-# pigpio afsluiten
 pwm.stop()
