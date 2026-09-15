@@ -231,12 +231,16 @@ def run_debug(camera_index: int) -> None:
 
 
 def run_snapshot(camera_index: int, count: int, outdir: str) -> None:
-    """Writes `count` frames + their threshold mask out as PNGs.
+    """Writes `count` frames + their threshold mask + an annotated overlay as PNGs.
 
     Use this if you don't have a display/X11: scp the outdir back to your
-    own machine and inspect the images. This lets you see exactly what
-    the camera is capturing and whether the threshold does/doesn't hit
-    the laser, without needing cv2.imshow on the Pi itself.
+    own machine and inspect the images. `frame_XX.png` is the raw camera
+    frame, `mask_XX.png` is the pre-filter brightness mask (can include
+    blobs that later get rejected — e.g. an overexposed window), and
+    `annotated_XX.png` shows the actual final decision: a green circle at
+    the (x, y) get_laser_position() would return, or a red "no candidate"
+    label if nothing passed the area/circularity filters. That last file
+    is the one that tells you whether the code picked the right spot.
     """
     import os
 
@@ -252,10 +256,26 @@ def run_snapshot(camera_index: int, count: int, outdir: str) -> None:
 
             gray = det._brightness_map(frame)
             mask, peak = det._brightness_mask(gray)
+            candidates = det._find_candidates(frame)
+
+            annotated = frame.copy()
+            if candidates:
+                cx, cy, circ = max(candidates, key=lambda c: c[2])
+                cv2.circle(annotated, (int(cx), int(cy)), 10, (0, 255, 0), 2)
+                cv2.putText(
+                    annotated, f"({cx:.0f},{cy:.0f}) circ={circ:.2f}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                )
+            else:
+                cv2.putText(
+                    annotated, "no candidate passed filters",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
+                )
 
             cv2.imwrite(f"{outdir}/frame_{i:02d}.png", frame)
             cv2.imwrite(f"{outdir}/mask_{i:02d}.png", mask)
-            print(f"frame {i}: peak brightness={peak}, saved")
+            cv2.imwrite(f"{outdir}/annotated_{i:02d}.png", annotated)
+            print(f"frame {i}: peak brightness={peak}, candidates={len(candidates)}, saved")
             time.sleep(0.3)
     finally:
         det.release()
