@@ -16,7 +16,7 @@ As a module:
     det = LaserDetector(camera_index=0)
     x, y = det.get_laser_position()   # None if not found
 
-    # Zelfde frame als een andere detector (geen extra camera):
+    # Same frame as another detector (no extra camera):
     det = LaserDetector(open_camera=False)
     x, y = det.detect_on_frame(frame)
 """
@@ -35,9 +35,10 @@ class LaserDetector:
         camera_index: int = 0,
         frame_width: int = 640,
         frame_height: int = 480,
-        exposure: int = 0,           # leave at 0; the adaptive threshold does the rest
-        min_peak_brightness: int = 40,   # frame must reach at least this peak level
-        peak_margin: int = 40,           # how far below the peak still counts as "laser"
+        exposure: int = 0,           # leave at 0; local-contrast detection does the rest
+        background_blur: int = 41,       # kernel size for estimating local background
+        min_peak_brightness: int = 25,   # min local contrast (not raw brightness) to consider
+        peak_margin: int = 10,           # how far below the strongest local contrast still counts
         min_area: int = 2,
         max_area: int = 400,
         min_circularity: float = 0.5,
@@ -46,6 +47,7 @@ class LaserDetector:
     ):
         self.min_peak_brightness = min_peak_brightness
         self.peak_margin = peak_margin
+        self.background_blur = background_blur | 1  # must be odd for cv2.blur/GaussianBlur-style kernels
         self.min_area = min_area
         self.max_area = max_area
         self.min_circularity = min_circularity
@@ -113,26 +115,37 @@ class LaserDetector:
         return cv2.GaussianBlur(channel_max, (5, 5), 0)
 
     def _brightness_mask(self, gray: np.ndarray) -> tuple[np.ndarray, int]:
-        """Adaptive threshold instead of a fixed value.
+        """Local-contrast threshold instead of a global-peak-relative one.
 
-        A fixed threshold (e.g. 250) breaks as soon as exposure/hardware
-        brightness changes: sometimes even the laser doesn't reach it
-        (set too dark), sometimes the whole scene reaches it anyway (too
-        bright, or the camera compensating during movement). By looking
-        at the brightest point of this specific frame and taking a
-        margin below it, this works regardless of the exact exposure —
-        as long as the laser is clearly brighter than the rest of the
-        image.
+        Comparing every pixel to the frame's single brightest pixel breaks
+        down on an evenly, brightly lit background (e.g. a well-lit white
+        wall): the whole wall sits close to the peak, so any margin wide
+        enough to also catch a somewhat-fainter laser ends up including
+        the entire wall too — there's nothing to tell "uniformly bright"
+        apart from "one bright spot" if you only ever look at the global
+        max.
 
-        Returns (mask, peak); peak is also used to ignore frames with no
-        visible laser (peak < min_peak_brightness).
+        Instead, estimate a local background level per pixel (a heavy
+        blur — the average of a fairly large neighborhood) and look at
+        how much each pixel exceeds ITS OWN neighborhood. A laser dot
+        stands out from its immediate surroundings regardless of whether
+        the overall scene is bright or dark; a uniformly lit wall does
+        not stand out from its own neighborhood at all, so it disappears
+        from this mask even though it may be close to the global peak
+        brightness.
+
+        Returns (mask, peak_contrast); peak_contrast is also used to
+        ignore frames where nothing stands out locally at all.
         """
-        peak = int(gray.max())
+        background = cv2.blur(gray, (self.background_blur, self.background_blur))
+        contrast = cv2.subtract(gray, background)  # clips to 0, so only "brighter than local bg" survives
+
+        peak = int(contrast.max())
         if peak < self.min_peak_brightness:
             return np.zeros_like(gray, dtype=np.uint8), peak
 
         threshold = max(peak - self.peak_margin, 0)
-        _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(contrast, threshold, 255, cv2.THRESH_BINARY)
         return mask, peak
 
     def _find_candidates(self, frame: np.ndarray) -> list[tuple[float, float, float]]:
@@ -165,7 +178,7 @@ class LaserDetector:
         return candidates
 
     def detect_on_frame(self, frame: np.ndarray) -> tuple[float, float] | None:
-        """Laserpositie in een bestaand frame, zonder extra camera te openen."""
+        """Laser position in an existing frame, without opening an extra camera."""
         if frame is None or frame.size == 0:
             return None
 
@@ -199,9 +212,9 @@ class LaserDetector:
             self.cap = None
 
 
-def run_debug(camera_index: int) -> None:
+def run_debug(camera_index: int, **detector_kwargs) -> None:
     """Live debug view: shows the camera feed, the threshold mask, and the detected position."""
-    det = LaserDetector(camera_index=camera_index)
+    det = LaserDetector(camera_index=camera_index, **detector_kwargs)
     prev_time = time.time()
 
     try:
@@ -254,13 +267,13 @@ def run_debug(camera_index: int) -> None:
         cv2.destroyAllWindows()
 
 
-def run_snapshot(camera_index: int, count: int, outdir: str) -> None:
+def run_snapshot(camera_index: int, count: int, outdir: str, **detector_kwargs) -> None:
     """Writes `count` frames + their threshold mask + an annotated overlay as PNGs.
 
     Use this if you don't have a display/X11: scp the outdir back to your
     own machine and inspect the images. `frame_XX.png` is the raw camera
     frame, `mask_XX.png` is the pre-filter brightness mask (can include
-    blobs that later get rejected — e.g. an overexposed window), and
+    blobs that later get rejected — e.g. an overexposed window/light), and
     `annotated_XX.png` shows the actual final decision: a green circle at
     the (x, y) get_laser_position() would return, or a red "no candidate"
     label if nothing passed the area/circularity filters. That last file
@@ -269,7 +282,7 @@ def run_snapshot(camera_index: int, count: int, outdir: str) -> None:
     import os
 
     os.makedirs(outdir, exist_ok=True)
-    det = LaserDetector(camera_index=camera_index)
+    det = LaserDetector(camera_index=camera_index, **detector_kwargs)
 
     try:
         for i in range(count):
@@ -307,7 +320,7 @@ def run_snapshot(camera_index: int, count: int, outdir: str) -> None:
     print(f"Done. Check the PNGs in {outdir}/ (scp them back to your machine).")
 
 
-def run_with_toggle_button(camera_index: int, button_pin: int) -> None:
+def run_with_toggle_button(camera_index: int, button_pin: int, **detector_kwargs) -> None:
     """Press the button to start detection, press again to stop — repeatable.
 
     Uses gpiozero's when_pressed callback instead of a blocking wait, since
@@ -327,7 +340,7 @@ def run_with_toggle_button(camera_index: int, button_pin: int) -> None:
     button.when_pressed = toggle
 
     print(f"Ready. Press the button on GPIO{button_pin} to start/stop.")
-    detector = LaserDetector(camera_index=camera_index)
+    detector = LaserDetector(camera_index=camera_index, **detector_kwargs)
     try:
         while True:
             if state["running"]:
@@ -356,16 +369,34 @@ if __name__ == "__main__":
              "resistor needed. Only applies to the normal run mode, not "
              "--debug or --snapshot.",
     )
+    parser.add_argument(
+        "--peak-margin", type=int, default=15,
+        help="How far below the frame's brightest point still counts as "
+             "'laser'. Raise this (try 40-60) if the laser gets missed "
+             "when something else in view (e.g. a ceiling light) is "
+             "brighter than the laser itself.",
+    )
+    parser.add_argument(
+        "--min-peak", type=int, default=40,
+        help="Minimum brightness the frame's peak must reach before we "
+             "even look for a laser. Lower this if the laser is just "
+             "generally dim, not competing with a brighter light source.",
+    )
     args = parser.parse_args()
 
+    detector_kwargs = {
+        "peak_margin": args.peak_margin,
+        "min_peak_brightness": args.min_peak,
+    }
+
     if args.snapshot:
-        run_snapshot(args.camera, args.snapshot, "snapshots")
+        run_snapshot(args.camera, args.snapshot, "snapshots", **detector_kwargs)
     elif args.debug:
-        run_debug(args.camera)
+        run_debug(args.camera, **detector_kwargs)
     elif args.button is not None:
-        run_with_toggle_button(args.camera, args.button)
+        run_with_toggle_button(args.camera, args.button, **detector_kwargs)
     else:
-        detector = LaserDetector(camera_index=args.camera)
+        detector = LaserDetector(camera_index=args.camera, **detector_kwargs)
         try:
             while True:
                 pos = detector.get_laser_position()
