@@ -283,12 +283,12 @@ def main():
     try:
         laser = LaserDetector(
             open_camera=False,
-            min_peak_brightness=180,
+            min_peak_brightness=25,
             peak_margin=10,
             min_area=2,
-            max_area=80,
-            min_circularity=0.65,
-            smoothing_window=3,
+            max_area=400,
+            min_circularity=0.6,
+            smoothing_window=5,
         )
         cap = amongus.open_camera()
         LaserDetector.configure_capture(cap)

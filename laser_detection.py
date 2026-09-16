@@ -41,8 +41,10 @@ class LaserDetector:
         peak_margin: int = 10,           # how far below the strongest local contrast still counts
         min_area: int = 2,
         max_area: int = 400,
-        min_circularity: float = 0.5,
+        min_circularity: float = 0.6,
         smoothing_window: int = 5,
+        miss_tolerance: int = 3,     # keep last known position for this many consecutive misses
+        roi: tuple[int, int, int, int] | None = None,  # (x1, y1, x2, y2): only look inside this box
         open_camera: bool = True,
     ):
         self.min_peak_brightness = min_peak_brightness
@@ -51,6 +53,10 @@ class LaserDetector:
         self.min_area = min_area
         self.max_area = max_area
         self.min_circularity = min_circularity
+        self.miss_tolerance = miss_tolerance
+        self.roi = roi
+        self._miss_count = 0
+        self._last_valid: tuple[float, float] | None = None
         self._history: deque[tuple[float, float]] = deque(maxlen=smoothing_window)
 
         self.cap = None
@@ -149,10 +155,40 @@ class LaserDetector:
         return mask, peak
 
     def _find_candidates(self, frame: np.ndarray) -> list[tuple[float, float, float]]:
-        """Returns a list of (x, y, circularity) candidates."""
-        gray = self._brightness_map(frame)
+        """Returns a list of (x, y, circularity) candidates, in full-frame coordinates.
+
+        No morphological opening here: the laser dot is often only a
+        handful of pixels after local-contrast subtraction, and an
+        opening step (erosion+dilation) with a kernel that size erases
+        genuine tiny detections entirely rather than cleaning up noise.
+        Closing (to fill small holes) is harmless and kept.
+
+        min_circularity matters more than it might seem at this scale:
+        printed edges/outlines (e.g. a picture taped to the wall) can
+        produce small curved-line fragments that pass the brightness
+        mask too. A short curved line segment has much lower circularity
+        (empirically ~0.1-0.6 in testing) than an actual filled laser dot
+        (~0.8-0.9), so a cutoff around 0.6 cleanly rejects those edge
+        fragments while keeping genuine dot detections. min_area/max_area
+        additionally reject large irregular bright regions (e.g. a lit
+        window).
+
+        If `roi` is set, only that sub-region is analyzed at all — useful
+        for excluding a known competing bright feature (e.g. a reflective
+        clock face) that would otherwise win over the actual laser purely
+        because it has more local contrast. Coordinates are converted back
+        to full-frame terms before being returned.
+        """
+        if self.roi is not None:
+            x1, y1, x2, y2 = self.roi
+            sub_frame = frame[y1:y2, x1:x2]
+            offset_x, offset_y = x1, y1
+        else:
+            sub_frame = frame
+            offset_x, offset_y = 0, 0
+
+        gray = self._brightness_map(sub_frame)
         mask, _ = self._brightness_mask(gray)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -171,29 +207,42 @@ class LaserDetector:
             M = cv2.moments(c)
             if M["m00"] == 0:
                 continue
-            cx = M["m10"] / M["m00"]
-            cy = M["m01"] / M["m00"]
+            cx = M["m10"] / M["m00"] + offset_x
+            cy = M["m01"] / M["m00"] + offset_y
             candidates.append((cx, cy, circularity))
 
         return candidates
 
     def detect_on_frame(self, frame: np.ndarray) -> tuple[float, float] | None:
-        """Laser position in an existing frame, without opening an extra camera."""
+        """Laser position in an existing frame, without opening an extra camera.
+
+        Tolerates a few consecutive missed frames (miss_tolerance) before
+        actually reporting None: a real laser that's genuinely detectable
+        can still momentarily fall just under the threshold on a single
+        frame due to sensor noise/exposure jitter, which otherwise shows
+        up as random-looking flicker even though nothing really changed.
+        """
         if frame is None or frame.size == 0:
             return None
 
         candidates = self._find_candidates(frame)
         if not candidates:
+            self._miss_count += 1
+            if self._last_valid is not None and self._miss_count <= self.miss_tolerance:
+                return self._last_valid
             self._history.clear()
+            self._last_valid = None
             return None
 
         # Pick the most circular candidate (most likely to be the laser, not noise)
         cx, cy, _ = max(candidates, key=lambda c: c[2])
+        self._miss_count = 0
         self._history.append((cx, cy))
 
         avg_x = sum(p[0] for p in self._history) / len(self._history)
         avg_y = sum(p[1] for p in self._history) / len(self._history)
-        return avg_x, avg_y
+        self._last_valid = (avg_x, avg_y)
+        return self._last_valid
 
     def get_laser_position(self) -> tuple[float, float] | None:
         """Returns the (smoothed) pixel position of the laser, or None."""
@@ -370,23 +419,60 @@ if __name__ == "__main__":
              "--debug or --snapshot.",
     )
     parser.add_argument(
-        "--peak-margin", type=int, default=15,
+        "--peak-margin", type=int, default=10,
         help="How far below the frame's brightest point still counts as "
              "'laser'. Raise this (try 40-60) if the laser gets missed "
              "when something else in view (e.g. a ceiling light) is "
              "brighter than the laser itself.",
     )
     parser.add_argument(
-        "--min-peak", type=int, default=40,
-        help="Minimum brightness the frame's peak must reach before we "
-             "even look for a laser. Lower this if the laser is just "
-             "generally dim, not competing with a brighter light source.",
+        "--min-peak", type=int, default=25,
+        help="Minimum local contrast (not raw brightness) before we "
+             "even look for a laser. Lower this if the laser's contrast "
+             "against its background is just generally weak.",
+    )
+    parser.add_argument(
+        "--background-blur", type=int, default=41,
+        help="Size of the neighborhood (in pixels) used to estimate local "
+             "background brightness. Larger tolerates broader smooth "
+             "lighting gradients; smaller reacts more locally but can be "
+             "noisier. Must end up odd (even values get +1 automatically).",
+    )
+    parser.add_argument(
+        "--miss-tolerance", type=int, default=3,
+        help="Number of consecutive frames the last known laser position "
+             "is kept before reporting 'not found'. Raise this if "
+             "detection flickers on/off frame-to-frame even though the "
+             "laser hasn't actually moved or disappeared.",
+    )
+    parser.add_argument(
+        "--roi", type=int, nargs=4, default=None, metavar=("X1", "Y1", "X2", "Y2"),
+        help="Only look for the laser inside this box (x1 y1 x2 y2, pixel "
+             "coordinates). Use this to exclude a known competing bright "
+             "feature in the shot (e.g. a reflective clock face) that "
+             "would otherwise out-compete the actual laser for local "
+             "contrast. Check annotated_XX.png from --snapshot to read "
+             "off good coordinates.",
+    )
+    parser.add_argument(
+        "--min-circularity", type=float, default=0.6,
+        help="Minimum roundness (0-1) a bright blob must have to count as "
+             "the laser. Printed edges/outlines (e.g. taped-up pictures) "
+             "can create small curved fragments that are bright enough "
+             "but not round; a real dot measured ~0.8-0.9 in testing "
+             "versus ~0.1-0.6 for edge fragments. Lower this only if the "
+             "real dot itself is being rejected (check circ= in "
+             "annotated_XX.png from --snapshot).",
     )
     args = parser.parse_args()
 
     detector_kwargs = {
         "peak_margin": args.peak_margin,
         "min_peak_brightness": args.min_peak,
+        "background_blur": args.background_blur,
+        "miss_tolerance": args.miss_tolerance,
+        "roi": tuple(args.roi) if args.roi else None,
+        "min_circularity": args.min_circularity,
     }
 
     if args.snapshot:
