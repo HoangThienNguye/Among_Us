@@ -43,7 +43,7 @@ class LaserDetector:
         max_area: int = 400,
         min_circularity: float = 0.6,
         smoothing_window: int = 5,
-        miss_tolerance: int = 3,     # keep last known position for this many consecutive misses
+        miss_tolerance: int = 0,     # keep last known position for this many consecutive misses
         roi: tuple[int, int, int, int] | None = None,  # (x1, y1, x2, y2): only look inside this box
         open_camera: bool = True,
     ):

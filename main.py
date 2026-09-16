@@ -34,11 +34,11 @@ HOEK_MIN = 5.0
 HOEK_MAX = 175.0
 
 # Pixels: kleiner dan dit is "raak".
-DREMPEL = 12
+DREMPEL = 18
 
 # Graden per pixel-fout, per frame. Klein houden.
-K = 0.02
-MAX_STAP = 2.0
+K = 0.01
+MAX_STAP = 0.8
 
 # Laser mag niet tot tegen de beeldrand.
 RAND = 24
@@ -283,12 +283,12 @@ def main():
     try:
         laser = LaserDetector(
             open_camera=False,
-            min_peak_brightness=25,
-            peak_margin=10,
+            min_peak_brightness=18,
+            peak_margin=30,
             min_area=2,
-            max_area=400,
-            min_circularity=0.6,
-            smoothing_window=5,
+            max_area=80,
+            min_circularity=0.70,
+            smoothing_window=2,
         )
         cap = amongus.open_camera()
         LaserDetector.configure_capture(cap)
