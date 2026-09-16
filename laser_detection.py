@@ -37,7 +37,7 @@ class LaserDetector:
         frame_height: int = 480,
         exposure: int = 0,           # leave at 0; the adaptive threshold does the rest
         min_peak_brightness: int = 40,   # frame must reach at least this peak level
-        peak_margin: int = 15,           # how far below the peak still counts as "laser"
+        peak_margin: int = 40,           # how far below the peak still counts as "laser"
         min_area: int = 2,
         max_area: int = 400,
         min_circularity: float = 0.5,
