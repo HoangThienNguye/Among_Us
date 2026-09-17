@@ -1,8 +1,14 @@
 """
-Draai dit bestand OP de Raspberry Pi.
-
-Leest de USB-camera uit, herkent rood/blauw Among Us,
+Leest de USB-camera uit, herkent Among Us,
 en streamt het beeld met percentage en vakje.
+
+Hoe het werkt:
+1. Bij het opstarten worden de voorbeeldfoto's omgezet naar "templates".
+2. Per camerabeeld schuift OpenCV die over het beeld (template matching).
+3. Past de vorm en is de kleur rood of blauw, dan komt er een vakje om.
+4. Het beeld gaat als JPEG naar de browser (MJPEG-stream).
+
+main.py importeert dit bestand en gebruikt verwerk_frame() en open_camera().
 
 Nodig in dezelfde map: amongus_rood.jpeg en amongus_blauw.jpeg
 Stoppen: Ctrl+C
@@ -21,14 +27,15 @@ import numpy as np
 os.chdir(os.path.dirname(os.path.abspath(__file__)) or ".")
 
 
-MIN_OVEREENKOMST_PROCENT = 60
-CAMERA = 0
-POORT = 8080
-BREEDTE = 640
-HOOGTE = 480
-JPEG_KWALITEIT = 70
-ZOEK_W, ZOEK_H = 320, 240
+MIN_OVEREENKOMST_PROCENT = 60   # hoe goed het op een Among Us moet lijken voor we het accepteren
+CAMERA = 0                      # camera-index; open_camera() zoekt er zelf ook naar
+POORT = 8080                    # poort waarop de stream te bekijken is
+BREEDTE = 640                   # elk frame wordt naar dit formaat geschaald, dus alle
+HOOGTE = 480                    # coordinaten in dit bestand liggen in 640x480
+JPEG_KWALITEIT = 70             # lager = kleiner plaatje, minder netwerk, minder scherp
+ZOEK_W, ZOEK_H = 320, 240       # halve grootte; hierop zoeken we grofweg, dat is sneller
 
+# Kleur van het vakje in het beeld.
 box_kleuren = {
     "rood": (0, 0, 255),
     "blauw": (255, 0, 0),
@@ -36,11 +43,15 @@ box_kleuren = {
 
 laatste_jpg = None
 slot = Lock()
-positie_geschiedenis = deque(maxlen=5)
+positie_geschiedenis = deque(maxlen=5)  # laatste 5 middelpunten, om te gladstrijken
 
 
 def get_amongus_position(x, y, w, h):
-    """Middelpunt van het vakje, een beetje gladgestreken. Later te versturen."""
+    """Middelpunt van het vakje in pixels, gemiddeld over de laatste 5 frames.
+
+    (x, y) is de linkerbovenhoek. Het gemiddelde haalt het gewiebel eruit,
+    maar loopt daardoor iets achter.
+    """
     cx = x + w / 2.0
     cy = y + h / 2.0
     positie_geschiedenis.append((cx, cy))
@@ -50,6 +61,11 @@ def get_amongus_position(x, y, w, h):
 
 
 def knip_amongus(image):
+    """Snijdt het poppetje uit een voorbeeldfoto, in grijswaarden.
+
+    THRESH_OTSU kiest zelf de grens tussen licht en donker. Van de
+    gevonden vlekken is de grootste het poppetje.
+    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -58,6 +74,11 @@ def knip_amongus(image):
 
 
 def roteer(img, hoek):
+    """Draait een template, voor als het poppetje schuin hangt.
+
+    Het canvas groeit mee (nw, nh), anders vallen de hoeken eraf. Lege
+    plekken worden wit, net als de achtergrond van de foto.
+    """
     if hoek == 0:
         return img
 
@@ -73,6 +94,10 @@ def roteer(img, hoek):
 
 
 def beste_match(gray, templates):
+    """Probeert alle templates en geeft (score, (x, y), breedte, hoogte) terug.
+
+    De score loopt van -1 tot 1, waarbij 1 perfect is.
+    """
     best_value = -1.0
     best_location = None
     best_w = 0
@@ -81,6 +106,7 @@ def beste_match(gray, templates):
     gh, gw = gray.shape
     for template in templates:
         h, w = template.shape
+        # Te klein, of groter dan het beeld: daar kan matchTemplate niks mee.
         if w < 12 or h < 12 or w > gw - 6 or h > gh - 6:
             continue
 
@@ -102,9 +128,15 @@ def beste_match(gray, templates):
 
 
 def kleur_maskers(hsv, soepel=True):
+    """Maakt twee maskers: waar zit rood, en waar zit blauw.
+
+    HSV in plaats van BGR, want de kleurtoon blijft gelijk bij ander licht.
+    s_min en v_min houden grijs en bijna-zwart buiten de deur.
+    """
     s_min = 15 if soepel else 40
     v_min = 20 if soepel else 45
-    # Rood: niet tot 160, want paarsblauw zit daar tegenaan
+    # Rood ligt aan beide uiteinden van de HSV-schaal (rond 0 en rond 180),
+    # daarom twee bereiken. Niet tot 160, want paarsblauw zit daar tegenaan.
     rood = cv2.inRange(hsv, (0, s_min, v_min), (10, 255, 255))
     rood |= cv2.inRange(hsv, (172, s_min, v_min), (180, 255, 255))
     # Blauw + paarsblauw (het blauwe poppetje is paarsachtig)
@@ -113,6 +145,10 @@ def kleur_maskers(hsv, soepel=True):
 
 
 def kleur_van_stuk(stuk):
+    """Welk deel van dit stukje beeld is rood, en welk deel blauw.
+
+    Twee getallen tussen 0 en 1; 0.35 betekent 35% van de pixels.
+    """
     if stuk.size < 20:
         return 0.0, 0.0
 
@@ -123,6 +159,12 @@ def kleur_van_stuk(stuk):
 
 
 def herken_kleur(roi):
+    """Geeft "rood", "blauw" of None voor het gevonden poppetje.
+
+    roi is het uitgesneden stukje beeld. Eerst wordt geteld hoeveel pixels
+    in het kleurbereik vallen; lukt dat niet, dan worden de gemiddelden van
+    de losse kanalen vergeleken (voor als het licht de kleur laat verwateren).
+    """
     if roi.size == 0:
         return None
 
@@ -130,12 +172,14 @@ def herken_kleur(roi):
     if h < 14 or w < 12:
         return None
 
-    # Lijf zit links/midden; vizier rechts niet meenemen
+    # Alleen het lijf (links/midden). Het vizier is bij beide poppetjes
+    # lichtblauw-grijs en zou de meting vertroebelen.
     lichaam = roi[int(h * 0.20):int(h * 0.84), int(w * 0.06):int(w * 0.55)]
     if lichaam.size < 20:
         lichaam = roi
 
     rood_deel, blauw_deel = kleur_van_stuk(lichaam)
+    # In BGR is kanaal 0 blauw, 1 groen en 2 rood.
     b = float(np.mean(lichaam[:, :, 0]))
     g = float(np.mean(lichaam[:, :, 1]))
     r = float(np.mean(lichaam[:, :, 2]))
@@ -154,6 +198,15 @@ def herken_kleur(roi):
     return None
 
 
+# Dit blok loopt één keer, zodra dit bestand gestart of geïmporteerd
+# wordt. Uit de twee voorbeeldfoto's maken we hier alle templates die
+# later bij elk camerabeeld gebruikt worden. Dat kost een paar seconden,
+# vandaar de meldingen in de terminal.
+#
+# templates       = alle formaten én draaihoeken, voor het nauwkeurig zoeken
+# templates_zoek  = alleen de rechte versies
+# templates_klein = die rechte versies op halve grootte, voor het snelle
+#                   grove zoeken over het hele beeld
 print("Templates laden...")
 templates = []
 templates_zoek = []
@@ -165,9 +218,18 @@ for bestand in ("amongus_rood.jpeg", "amongus_blauw.jpeg"):
         raise SystemExit(1)
 
     vorm = knip_amongus(image)
+    # Eerst op een vaste hoogte van 80 pixels zetten, zodat beide foto's
+    # even groot beginnen (de breedte schaalt mee). equalizeHist trekt
+    # licht en donker gelijk, waardoor de match minder afhangt van de
+    # lamp in de kamer. Datzelfde doen we straks met het camerabeeld.
     vorm = cv2.resize(vorm, (int(vorm.shape[1] * 80 / vorm.shape[0]), 80))
     vorm = cv2.equalizeHist(vorm)
 
+    # Het poppetje kan dichtbij of ver weg zijn, dus maken we 12 formaten
+    # van klein (0.14x) tot groot (3.10x). geomspace verdeelt die stappen
+    # steeds met dezelfde factor in plaats van met een vast verschil, wat
+    # beter past bij afstand: van 0.14 naar 0.20 is net zo'n grote stap
+    # als van 2.0 naar 3.0.
     for scale in np.geomspace(0.14, 3.10, 12):
         w = int(vorm.shape[1] * scale)
         h = int(vorm.shape[0] * scale)
@@ -175,6 +237,8 @@ for bestand in ("amongus_rood.jpeg", "amongus_blauw.jpeg"):
             continue
         basis = cv2.resize(vorm, (w, h))
         templates_zoek.append(basis)
+        # Per formaat ook een versie naar links en naar rechts gekanteld,
+        # zodat een schuin hangend poppetje ook past.
         for hoek in (-18, 0, 18):
             templates.append(roteer(basis, hoek))
 
@@ -182,11 +246,25 @@ templates_klein = [
     cv2.resize(t, (max(10, t.shape[1] // 2), max(10, t.shape[0] // 2)))
     for t in templates_zoek
 ]
-drempel = MIN_OVEREENKOMST_PROCENT / 100.0
+drempel = MIN_OVEREENKOMST_PROCENT / 100.0  # 60 procent wordt 0.60, want scores lopen van 0 tot 1
 print("Templates klaar.")
 
 
 def verfinen(gray, x, y, bw, bh):
+    """Zoekt nauwkeurig, maar alleen in een klein gebied rond een eerdere vondst.
+
+    Dit is veel sneller dan het hele beeld afzoeken, en dat kan ook: tussen
+    twee camerabeelden beweegt het poppetje maar een klein stukje. We nemen
+    het oude vakje plus 40% marge eromheen (pad) en zoeken alleen daarin.
+
+    Ook gebruiken we alleen templates die qua breedte in de buurt liggen van
+    wat we vorige keer vonden (tussen de helft en 1,7 keer zo breed), want de
+    afstand tot de camera verandert niet ineens.
+
+    Aan het eind worden x en y opgeteld bij x1 en y1, om de plek terug te
+    rekenen naar coordinaten in het hele beeld. beste_match() rekent namelijk
+    binnen het uitgesneden stukje.
+    """
     pad = int(0.40 * max(bw, bh))
     x1 = max(0, x - pad)
     y1 = max(0, y - pad)
@@ -202,6 +280,16 @@ def verfinen(gray, x, y, bw, bh):
 
 
 def zoek_overal(gray):
+    """Zoekt in het hele beeld, in twee stappen.
+
+    Eerst op halve grootte (320x240) met de kleine templates. Dat is vier
+    keer zo weinig pixels en dus een stuk sneller. De gevonden plek en maten
+    worden daarna met 2 vermenigvuldigd om terug te komen in 640x480.
+
+    Daarna nog een keer verfinen() op de volle resolutie voor een preciezer
+    vakje. Levert dat een duidelijk slechtere score op (minder dan 85% van de
+    grove score), dan houden we toch de grove uitkomst.
+    """
     klein = cv2.resize(gray, (ZOEK_W, ZOEK_H))
     waarde, loc, w, h = beste_match(klein, templates_klein)
     if loc is None:
@@ -216,7 +304,26 @@ def zoek_overal(gray):
 
 
 def verwerk_frame(frame, vorige):
+    """Verwerkt één camerabeeld: zoeken, kleur bepalen en tekenen.
+
+    Dit is de kern van het bestand, en de functie die main.py gebruikt.
+
+    Meegeven:
+      frame   - het ruwe beeld van de camera
+      vorige  - waar we het vorige frame iets vonden, of None als we
+                niets hadden. Daarmee kan er in de buurt gezocht worden
+                in plaats van overal.
+
+    Geeft vier dingen terug:
+      frame   - hetzelfde beeld, nu met tekst en eventueel een vakje erop
+      vorige  - (x, y, breedte, hoogte) van deze vondst, of None. Die geef
+                je bij het volgende frame weer mee.
+      positie - (x, y) middelpunt van het poppetje, of None
+      kleur   - "rood", "blauw" of None
+    """
     frame = cv2.resize(frame, (BREEDTE, HOOGTE)).copy()
+    # equalizeHist ook hier, net als bij de templates. Zo vergelijken we
+    # appels met appels, ongeacht hoe licht of donker het beeld is.
     gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
 
     loc = None
@@ -224,15 +331,21 @@ def verwerk_frame(frame, vorige):
     best_w = 0
     best_h = 0
 
+    # Stap 1: hadden we vorige keer iets gevonden? Kijk dan eerst daar in
+    # de buurt, want dat is snel.
     if vorige is not None:
         x, y, bw, bh = vorige
         best_value, loc, best_w, best_h = verfinen(gray, x, y, bw, bh)
 
+    # Stap 2: niets gevonden, of de score is te laag om te vertrouwen.
+    # Dan toch het hele beeld afzoeken. Dat kost meer tijd, dus doen we
+    # het alleen als het nodig is.
     if loc is None or best_value < 0.48:
         gwaarde, gloc, gw, gh = zoek_overal(gray)
         if gloc is not None and gwaarde >= best_value:
             best_value, loc, best_w, best_h = gwaarde, gloc, gw, gh
 
+    # Iets gevonden dat qua vorm klopt? Kijk dan of de kleur ook past.
     kleur = None
     if loc is not None:
         x, y = max(0, loc[0]), max(0, loc[1])
@@ -247,6 +360,8 @@ def verwerk_frame(frame, vorige):
     else:
         procent = int(np.clip(best_value, 0.0, 1.0) * 100)
 
+    # Alleen goedkeuren als de vorm genoeg lijkt EN de kleur duidelijk is.
+    # Een van de twee is niet genoeg; anders gaat hij op alles reageren.
     geaccepteerd = kleur is not None and best_value >= drempel
 
     cv2.putText(
@@ -279,12 +394,21 @@ def verwerk_frame(frame, vorige):
         )
         return frame, vorige, (mx, my), kleur
 
+    # Niet goedgekeurd: vorige op None zetten, zodat we het volgende frame
+    # weer overal zoeken. De geschiedenis leegmaken zorgt ervoor dat oude
+    # posities niet meetellen als het poppetje straks ergens anders opduikt.
     vorige = None
     positie_geschiedenis.clear()
     return frame, vorige, None, None
 
 
 def open_camera():
+    """Zoekt de USB-camera en geeft een geopende VideoCapture terug.
+
+    BUFFERSIZE op 1 zodat we steeds het nieuwste beeld krijgen en niet een
+    paar frames achterlopen. Dat is belangrijk als de servo's erop reageren.
+
+    """
     print("Beschikbare video-apparaten:")
     for i in range(10):
         pad = f"/dev/video{i}"
@@ -312,6 +436,12 @@ def open_camera():
 
 
 def camera_loop(cap):
+    """Blijft camerabeelden lezen, verwerken en als JPEG klaarzetten.
+
+    Deze functie wordt alleen gebruikt als je dit bestand zelf start.
+    main.py heeft zijn eigen lus, omdat daar ook de laser en de servo's
+    bij komen.
+    """
     global laatste_jpg
     vorige = None
     print("USB-camera gestart, herkenning aan.")
@@ -329,10 +459,21 @@ def camera_loop(cap):
 
 
 class StreamHandler(BaseHTTPRequestHandler):
+    """Kleine webserver die het laatste beeld als MJPEG-stream doorgeeft.
+
+    MJPEG is niets anders dan losse JPEG's achter elkaar binnen één
+    verbinding. De browser houdt die verbinding open en vervangt steeds het
+    plaatje, waardoor het video lijkt. Daar is dus geen videobibliotheek
+    voor nodig.
+    """
+
     def log_message(self, formaat, *args):
+        # Standaard logt deze webserver elke opvraging. Dat zou de
+        # coordinaten in de terminal onleesbaar maken, dus we doen niets.
         return
 
     def do_GET(self):
+        """Handelt een verzoek van de browser af. Alles buiten deze paden is 404."""
         if self.path not in ("/", "/stream", "/stream.mjpg"):
             self.send_error(404)
             return
@@ -341,6 +482,9 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.send_header("Age", "0")
         self.send_header("Cache-Control", "no-cache, private")
         self.send_header("Pragma", "no-cache")
+        # multipart/x-mixed-replace vertelt de browser: er komen steeds
+        # nieuwe plaatjes die het vorige vervangen. "boundary=frame" is het
+        # woord waarmee we hieronder elk nieuw plaatje aankondigen.
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.end_headers()
 
@@ -356,8 +500,9 @@ class StreamHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"Content-Length: {len(jpg)}\r\n\r\n".encode())
                 self.wfile.write(jpg)
                 self.wfile.write(b"\r\n")
-                time.sleep(0.03)
+                time.sleep(0.03)  # ongeveer 30 beelden per seconde
         except (BrokenPipeError, ConnectionResetError):
+            # Browser is weg (tabblad gesloten). Geen fout, gewoon stoppen.
             return
 
 
